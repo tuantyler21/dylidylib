@@ -3,10 +3,12 @@
  * Inject into Meitu via LiveContainer.
  *
  * What this does:
- *  1. Blocks all VIP/paywall ViewControllers from presenting
- *  2. Forces VIP status to YES on all gate-keeping classes
- *  3. Spoofs IDFV with a random UUID each launch → server quota resets
- *  4. Suppresses ad SDK initialization and display
+ *  1. Blocks paywall VCs from presenting (presentViewController hook)
+ *  2. Dismisses any paywall VC that slips through (viewDidAppear hook)
+ *  3. Blocks paywall views added as subviews (addSubview hook)
+ *  4. Calls unlock completion(YES) so filters actually apply after paywall is blocked
+ *  5. Spoofs IDFV with a random UUID each launch → server quota resets
+ *  6. Suppresses ad SDK initialization and display
  */
 
 #import <Foundation/Foundation.h>
@@ -132,58 +134,114 @@ static NSUUID *gSpoofedUUID = nil;
 @end
 
 // ─────────────────────────────────────────────────────────────
-// MARK: - 3. VIP Status Forcing
+// MARK: - 3. Filter Unlock — call completion(YES) so filters apply
 // ─────────────────────────────────────────────────────────────
+// The app calls showVipUnlockViewIn:materials:unlockType:completion: before
+// showing a premium filter. The completion block applies the filter only when
+// called with YES. We swizzle it to call completion(YES) immediately.
 
-// Called after a short delay so Swift classes are fully registered
-static void installVIPHooks(void) {
-    // All known VIP gate classes (ObjC + Swift mangled names)
-    NSArray<NSString *> *vipClasses = @[
-        @"_TtC11MTVIPModule12MTVipService",
-        @"MTVipService",
-        @"MTUserVipInfo",
-        @"MTSubscriptionVipInfo",
-        @"MTVipManager",
-        @"MTVIPManager",
-    ];
+static void installUnlockHook(void) {
+    SEL unlockSEL = NSSelectorFromString(@"showVipUnlockViewIn:materials:unlockType:completion:");
 
-    // Selectors that should return YES
-    NSArray<NSString *> *yesSelectors = @[
-        @"isCurrentUserVip",
-        @"isCurrentUserSVip",
-        @"isCurrentReallyUserVip",
-        @"isVip",
-        @"isVipUser",
-        @"isSVip",
-        @"isPremium",
-        @"isSubscribed",
-        @"inTrialPeriod",
-        @"hasVip",
-    ];
+    // Scan every class for this selector (we don't know the exact class name)
+    int classCount = objc_getClassList(NULL, 0);
+    Class *classes = (__unsafe_unretained Class *)malloc(sizeof(Class) * classCount);
+    objc_getClassList(classes, classCount);
 
-    // Selectors that should return NO (negative/limit guards)
-    NSArray<NSString *> *noSelectors = @[
-        @"isFreeUser",
-        @"isLimitTrial",
-        @"shouldShowVipAlert",
-        @"needsUpgrade",
-    ];
+    for (int i = 0; i < classCount; i++) {
+        Class cls = classes[i];
+        Method m = class_getInstanceMethod(cls, unlockSEL);
+        if (!m) continue;
 
-    for (NSString *className in vipClasses) {
-        Class cls = NSClassFromString(className);
-        if (!cls) continue;
-        for (NSString *selName in yesSelectors) {
-            forceReturnYES(cls, NSSelectorFromString(selName));
-        }
-        for (NSString *selName in noSelectors) {
-            forceReturnNO(cls, NSSelectorFromString(selName));
-        }
-        NSLog(@"[MeituTweak] VIP hooks applied on %@", className);
+        IMP callCompletionYES = imp_implementationWithBlock(
+            ^(id _self, id container, id materials, NSInteger unlockType, void(^completion)(BOOL)) {
+                NSLog(@"[MeituTweak] showVipUnlockView intercepted → calling completion(YES)");
+                if (completion) completion(YES);
+            }
+        );
+        method_setImplementation(m, callCompletionYES);
+        NSLog(@"[MeituTweak] Hooked showVipUnlockViewIn: on %s", class_getName(cls));
     }
+    free(classes);
 }
 
 // ─────────────────────────────────────────────────────────────
-// MARK: - 4. Ad SDK Suppression
+// MARK: - 4. Dismiss paywall VCs that slip through (viewDidAppear)
+// ─────────────────────────────────────────────────────────────
+
+@interface UIViewController (MeituPaywallDismiss)
+- (void)mt_viewDidAppear:(BOOL)animated;
+@end
+
+@implementation UIViewController (MeituPaywallDismiss)
+
++ (void)load {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        swizzleInstance(self,
+            @selector(viewDidAppear:),
+            @selector(mt_viewDidAppear:));
+    });
+}
+
+- (void)mt_viewDidAppear:(BOOL)animated {
+    [self mt_viewDidAppear:animated]; // call original first
+    if (isPaywallVC(self)) {
+        NSLog(@"[MeituTweak] Dismissing paywall VC in viewDidAppear: %@", NSStringFromClass([self class]));
+        [self dismissViewControllerAnimated:NO completion:nil];
+    }
+}
+
+@end
+
+// ─────────────────────────────────────────────────────────────
+// MARK: - 5. Block paywall views added as subviews
+// ─────────────────────────────────────────────────────────────
+
+static NSArray<NSString *> *paywallViewKeywords(void) {
+    return @[
+        @"MTPWVip", @"MTPayWindow", @"MTVipCenter", @"MTVipUnlock",
+        @"MTVipBuy", @"MTVipPay", @"MTVipAlert", @"MTSubscription",
+        @"VipUnlockBar", @"VipUnlockView", @"MTVipMask"
+    ];
+}
+
+static BOOL isPaywallView(UIView *view) {
+    NSString *name = NSStringFromClass([view class]);
+    for (NSString *kw in paywallViewKeywords()) {
+        if ([name containsString:kw]) return YES;
+    }
+    return NO;
+}
+
+@interface UIView (MeituPaywallSubview)
+- (void)mt_addSubview:(UIView *)view;
+@end
+
+@implementation UIView (MeituPaywallSubview)
+
++ (void)load {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        swizzleInstance(self,
+            @selector(addSubview:),
+            @selector(mt_addSubview:));
+        NSLog(@"[MeituTweak] addSubview hook installed");
+    });
+}
+
+- (void)mt_addSubview:(UIView *)view {
+    if (isPaywallView(view)) {
+        NSLog(@"[MeituTweak] Blocked paywall subview: %@", NSStringFromClass([view class]));
+        return;
+    }
+    [self mt_addSubview:view]; // original
+}
+
+@end
+
+// ─────────────────────────────────────────────────────────────
+// MARK: - 6. Ad SDK Suppression
 // ─────────────────────────────────────────────────────────────
 
 static void installAdHooks(void) {
@@ -237,7 +295,7 @@ static void MeituTweakInit(void) {
     // Delay slightly so all ObjC classes finish registering
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        installVIPHooks();
+        installUnlockHook();
         installAdHooks();
         NSLog(@"[MeituTweak] All hooks active ✓");
     });
