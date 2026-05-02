@@ -64,7 +64,9 @@ static NSArray<NSString *> *paywallKeywords(void) {
 }
 
 static BOOL isPaywallVC(UIViewController *vc) {
+    if (!vc) return NO;
     NSString *name = NSStringFromClass([vc class]);
+    if (!name) return NO;
     for (NSString *kw in paywallKeywords()) {
         if ([name containsString:kw]) return YES;
     }
@@ -207,7 +209,9 @@ static NSArray<NSString *> *paywallViewKeywords(void) {
 }
 
 static BOOL isPaywallView(UIView *view) {
+    if (!view) return NO;
     NSString *name = NSStringFromClass([view class]);
+    if (!name) return NO;
     for (NSString *kw in paywallViewKeywords()) {
         if ([name containsString:kw]) return YES;
     }
