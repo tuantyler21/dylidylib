@@ -142,17 +142,19 @@ static NSUUID *gSpoofedUUID = nil;
 static void installUnlockHook(void) {
     SEL unlockSEL = NSSelectorFromString(@"showVipUnlockViewIn:materials:unlockType:completion:");
 
-    // Only scan classes from the main executable to avoid crashing on system classes
-    unsigned int imageClassCount = 0;
-    const char **imageClassNames = objc_copyClassNamesForImage(
-        [[[NSBundle mainBundle] executablePath] fileSystemRepresentation],
-        &imageClassCount
-    );
-    if (!imageClassNames) return;
+    // Scan only MT* and Swift Meitu classes — safe and fast
+    unsigned int classCount = 0;
+    Class *classes = objc_copyClassList(&classCount);
+    if (!classes) return;
 
-    for (unsigned int i = 0; i < imageClassCount; i++) {
-        Class cls = objc_getClass(imageClassNames[i]);
-        if (!cls) continue;
+    int found = 0;
+    for (unsigned int i = 0; i < classCount; i++) {
+        Class cls = classes[i];
+        const char *cname = class_getName(cls);
+        if (!cname) continue;
+        // Only check Meitu classes (MT prefix or Swift mangled _TtC)
+        if (strncmp(cname, "MT", 2) != 0 && strncmp(cname, "_TtC", 4) != 0) continue;
+
         Method m = class_getInstanceMethod(cls, unlockSEL);
         if (!m) continue;
 
@@ -163,9 +165,14 @@ static void installUnlockHook(void) {
             }
         );
         method_setImplementation(m, callCompletionYES);
-        NSLog(@"[MeituTweak] Hooked showVipUnlockViewIn: on %s", class_getName(cls));
+        NSLog(@"[MeituTweak] Hooked showVipUnlockViewIn: on %s", cname);
+        found++;
     }
-    free(imageClassNames);
+    free(classes);
+
+    if (found == 0) {
+        NSLog(@"[MeituTweak] WARNING: showVipUnlockViewIn: not found in any MT class");
+    }
 }
 
 // ─────────────────────────────────────────────────────────────
