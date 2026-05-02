@@ -138,20 +138,21 @@ static NSUUID *gSpoofedUUID = nil;
 // ─────────────────────────────────────────────────────────────
 // MARK: - 3. Filter Unlock — call completion(YES) so filters apply
 // ─────────────────────────────────────────────────────────────
-// The app calls showVipUnlockViewIn:materials:unlockType:completion: before
-// showing a premium filter. The completion block applies the filter only when
-// called with YES. We swizzle it to call completion(YES) immediately.
 
 static void installUnlockHook(void) {
     SEL unlockSEL = NSSelectorFromString(@"showVipUnlockViewIn:materials:unlockType:completion:");
 
-    // Scan every class for this selector (we don't know the exact class name)
-    int classCount = objc_getClassList(NULL, 0);
-    Class *classes = (__unsafe_unretained Class *)malloc(sizeof(Class) * classCount);
-    objc_getClassList(classes, classCount);
+    // Only scan classes from the main executable to avoid crashing on system classes
+    unsigned int imageClassCount = 0;
+    const char **imageClassNames = objc_copyClassNamesForImage(
+        [[[NSBundle mainBundle] executablePath] fileSystemRepresentation],
+        &imageClassCount
+    );
+    if (!imageClassNames) return;
 
-    for (int i = 0; i < classCount; i++) {
-        Class cls = classes[i];
+    for (unsigned int i = 0; i < imageClassCount; i++) {
+        Class cls = objc_getClass(imageClassNames[i]);
+        if (!cls) continue;
         Method m = class_getInstanceMethod(cls, unlockSEL);
         if (!m) continue;
 
@@ -164,7 +165,7 @@ static void installUnlockHook(void) {
         method_setImplementation(m, callCompletionYES);
         NSLog(@"[MeituTweak] Hooked showVipUnlockViewIn: on %s", class_getName(cls));
     }
-    free(classes);
+    free(imageClassNames);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -192,54 +193,6 @@ static void installUnlockHook(void) {
         NSLog(@"[MeituTweak] Dismissing paywall VC in viewDidAppear: %@", NSStringFromClass([self class]));
         [self dismissViewControllerAnimated:NO completion:nil];
     }
-}
-
-@end
-
-// ─────────────────────────────────────────────────────────────
-// MARK: - 5. Block paywall views added as subviews
-// ─────────────────────────────────────────────────────────────
-
-static NSArray<NSString *> *paywallViewKeywords(void) {
-    return @[
-        @"MTPWVip", @"MTPayWindow", @"MTVipCenter", @"MTVipUnlock",
-        @"MTVipBuy", @"MTVipPay", @"MTVipAlert", @"MTSubscription",
-        @"VipUnlockBar", @"VipUnlockView", @"MTVipMask"
-    ];
-}
-
-static BOOL isPaywallView(UIView *view) {
-    if (!view) return NO;
-    NSString *name = NSStringFromClass([view class]);
-    if (!name) return NO;
-    for (NSString *kw in paywallViewKeywords()) {
-        if ([name containsString:kw]) return YES;
-    }
-    return NO;
-}
-
-@interface UIView (MeituPaywallSubview)
-- (void)mt_addSubview:(UIView *)view;
-@end
-
-@implementation UIView (MeituPaywallSubview)
-
-+ (void)load {
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        swizzleInstance(self,
-            @selector(addSubview:),
-            @selector(mt_addSubview:));
-        NSLog(@"[MeituTweak] addSubview hook installed");
-    });
-}
-
-- (void)mt_addSubview:(UIView *)view {
-    if (isPaywallView(view)) {
-        NSLog(@"[MeituTweak] Blocked paywall subview: %@", NSStringFromClass([view class]));
-        return;
-    }
-    [self mt_addSubview:view]; // original
 }
 
 @end
